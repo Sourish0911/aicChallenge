@@ -157,6 +157,12 @@ def launch_setup(context, *args, **kwargs):
         condition=UnlessCondition(activate_joint_controller),
     )
 
+    gripper_action_controller_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["gripper_action_controller", "--controller-manager", "/controller_manager"],
+    )
+
     fts_broadcaster_spawner = Node(
         package="controller_manager",
         executable="spawner",
@@ -208,6 +214,7 @@ def launch_setup(context, *args, **kwargs):
         initial_joint_controller_spawner_stopped,
         initial_joint_controller_spawner_started,
         fts_broadcaster_spawner,
+        gripper_action_controller_spawner,
         gzserver,
         gzgui,
         ros_gz_bridge,
@@ -215,7 +222,6 @@ def launch_setup(context, *args, **kwargs):
     ]
 
     return nodes_to_start
-
 
 def generate_launch_description():
     declared_arguments = []
