@@ -27,7 +27,7 @@ services:
     environment:
       RMW_IMPLEMENTATION: rmw_zenoh_cpp
       ZENOH_ROUTER_CHECK_ATTEMPTS: -1
-      AIC_MODEL_ROUTER_ADDR: model-router:7447
+      AIC_MODEL_ROUTER_ADDR: eval:7447
       AIC_MODEL_PASSWD: CHANGE_IN_PROD
       AIC_MODEL_ROUTER_PASSWD: CHANGE_IN_PROD
 networks:
