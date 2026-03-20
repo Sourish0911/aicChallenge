@@ -15,6 +15,9 @@
 #
 
 
+from pathlib import Path
+
+import cv2
 import numpy as np
 
 from aic_model.policy import (
@@ -26,12 +29,76 @@ from aic_model.policy import (
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 from geometry_msgs.msg import Point, Pose, Quaternion, Transform
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from rclpy.duration import Duration
 from rclpy.time import Time
 from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 
 QuaternionTuple = tuple[float, float, float, float]
+
+# LeRobot dataset feature definitions matching the AIC robot
+LEROBOT_FEATURES = {
+    "observation.state": {
+        "dtype": "float32",
+        "shape": (26,),
+        "names": [
+            "tcp_pose.position.x",
+            "tcp_pose.position.y",
+            "tcp_pose.position.z",
+            "tcp_pose.orientation.x",
+            "tcp_pose.orientation.y",
+            "tcp_pose.orientation.z",
+            "tcp_pose.orientation.w",
+            "tcp_velocity.linear.x",
+            "tcp_velocity.linear.y",
+            "tcp_velocity.linear.z",
+            "tcp_velocity.angular.x",
+            "tcp_velocity.angular.y",
+            "tcp_velocity.angular.z",
+            "tcp_error.x",
+            "tcp_error.y",
+            "tcp_error.z",
+            "tcp_error.rx",
+            "tcp_error.ry",
+            "tcp_error.rz",
+            "joint_positions.0",
+            "joint_positions.1",
+            "joint_positions.2",
+            "joint_positions.3",
+            "joint_positions.4",
+            "joint_positions.5",
+            "joint_positions.6",
+        ],
+    },
+    "observation.images.left_camera": {
+        "dtype": "video",
+        "shape": (3, 256, 288),
+    },
+    "observation.images.center_camera": {
+        "dtype": "video",
+        "shape": (3, 256, 288),
+    },
+    "observation.images.right_camera": {
+        "dtype": "video",
+        "shape": (3, 256, 288),
+    },
+    "action": {
+        "dtype": "float32",
+        "shape": (7,),
+        "names": [
+            "pose.position.x",
+            "pose.position.y",
+            "pose.position.z",
+            "pose.orientation.x",
+            "pose.orientation.y",
+            "pose.orientation.z",
+            "pose.orientation.w",
+        ],
+    },
+}
+
+IMAGE_SCALE = 0.25
 
 
 class CheatCode(Policy):
@@ -40,6 +107,8 @@ class CheatCode(Policy):
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._task = None
+        self._dataset = None
+        self._episode_count = 0
         super().__init__(parent_node)
 
     def _wait_for_tf(
@@ -184,6 +253,92 @@ class CheatCode(Policy):
             ),
         )
 
+    def _init_dataset(self, task_description: str) -> None:
+        """Initialize the LeRobot dataset for recording."""
+        dataset_dir = Path.home() / "aic_datasets" / "cheatcode"
+        self.get_logger().info(f"Initializing LeRobot dataset at {dataset_dir}")
+        self._dataset = LeRobotDataset.create(
+            repo_id="aic/cheatcode",
+            root=dataset_dir,
+            fps=20,
+            features=LEROBOT_FEATURES,
+            image_compression="h264",
+        )
+        self.get_logger().info("LeRobot dataset initialized.")
+
+    def _extract_observation_state(self, obs: Observation) -> np.ndarray:
+        """Extract the 26-dim state vector from an Observation message."""
+        tcp_pose = obs.controller_state.tcp_pose
+        tcp_vel = obs.controller_state.tcp_velocity
+        return np.array(
+            [
+                tcp_pose.position.x,
+                tcp_pose.position.y,
+                tcp_pose.position.z,
+                tcp_pose.orientation.x,
+                tcp_pose.orientation.y,
+                tcp_pose.orientation.z,
+                tcp_pose.orientation.w,
+                tcp_vel.linear.x,
+                tcp_vel.linear.y,
+                tcp_vel.linear.z,
+                tcp_vel.angular.x,
+                tcp_vel.angular.y,
+                tcp_vel.angular.z,
+                *obs.controller_state.tcp_error,
+                *obs.joint_states.position[:7],
+            ],
+            dtype=np.float32,
+        )
+
+    def _extract_camera_image(self, raw_img) -> np.ndarray:
+        """Convert a ROS Image message to a scaled HWC uint8 numpy array."""
+        img_np = np.frombuffer(raw_img.data, dtype=np.uint8).reshape(
+            raw_img.height, raw_img.width, 3
+        )
+        return cv2.resize(
+            img_np,
+            None,
+            fx=IMAGE_SCALE,
+            fy=IMAGE_SCALE,
+            interpolation=cv2.INTER_AREA,
+        )
+
+    def _record_frame(
+        self, obs: Observation, pose: Pose
+    ) -> None:
+        """Record a single observation+action frame to the dataset."""
+        if self._dataset is None:
+            return
+
+        action = np.array(
+            [
+                pose.position.x,
+                pose.position.y,
+                pose.position.z,
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ],
+            dtype=np.float32,
+        )
+
+        frame = {
+            "observation.state": self._extract_observation_state(obs),
+            "observation.images.left_camera": self._extract_camera_image(
+                obs.left_image
+            ),
+            "observation.images.center_camera": self._extract_camera_image(
+                obs.center_image
+            ),
+            "observation.images.right_camera": self._extract_camera_image(
+                obs.right_image
+            ),
+            "action": action,
+        }
+        self._dataset.add_frame(frame)
+
     def insert_cable(
         self,
         task: Task,
@@ -193,6 +348,13 @@ class CheatCode(Policy):
     ):
         self.get_logger().info(f"CheatCode.insert_cable() task: {task}")
         self._task = task
+
+        # Initialize dataset on first episode
+        if self._dataset is None:
+            self._init_dataset(
+                f"Insert {task.cable_name}/{task.plug_name} into "
+                f"{task.target_module_name}/{task.port_name}"
+            )
 
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
@@ -221,16 +383,18 @@ class CheatCode(Policy):
         for t in range(0, 100):
             interp_fraction = t / 100.0
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self.calc_gripper_pose(
-                        port_transform,
-                        slerp_fraction=interp_fraction,
-                        position_fraction=interp_fraction,
-                        z_offset=z_offset,
-                        reset_xy_integrator=True,
-                    ),
+                pose = self.calc_gripper_pose(
+                    port_transform,
+                    slerp_fraction=interp_fraction,
+                    position_fraction=interp_fraction,
+                    z_offset=z_offset,
+                    reset_xy_integrator=True,
                 )
+                self.set_pose_target(move_robot=move_robot, pose=pose)
+
+                obs = get_observation()
+                if obs is not None:
+                    self._record_frame(obs, pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
             self.sleep_for(0.05)
@@ -243,13 +407,23 @@ class CheatCode(Policy):
             z_offset -= 0.0005
             self.get_logger().info(f"z_offset: {z_offset:0.5}")
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self.calc_gripper_pose(port_transform, z_offset=z_offset),
-                )
+                pose = self.calc_gripper_pose(port_transform, z_offset=z_offset)
+                self.set_pose_target(move_robot=move_robot, pose=pose)
+
+                obs = get_observation()
+                if obs is not None:
+                    self._record_frame(obs, pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insertion: {ex}")
             self.sleep_for(0.05)
+
+        # Save this episode to disk
+        if self._dataset is not None:
+            self._dataset.save_episode()
+            self._episode_count += 1
+            self.get_logger().info(
+                f"Saved episode {self._episode_count} to LeRobot dataset."
+            )
 
         self.get_logger().info("Waiting for connector to stabilize...")
         self.sleep_for(5.0)
